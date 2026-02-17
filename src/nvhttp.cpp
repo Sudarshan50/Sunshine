@@ -2,7 +2,6 @@
  * @file src/nvhttp.cpp
  * @brief Definitions for the nvhttp (GameStream) server.
  */
-// macros
 #define BOOST_BIND_GLOBAL_PLACEHOLDERS
 
 // standard includes
@@ -582,22 +581,9 @@ namespace nvhttp {
         auto ptr = map_id_sess.emplace(sess.client.uniqueID, std::move(sess)).first;
 
         ptr->second.async_insert_pin.salt = std::move(get_arg(args, "salt"));
-        if (config::sunshine.flags[config::flag::PIN_STDIN]) {
-          std::string pin;
-
-          std::cout << "Please insert pin: "sv;
-          std::getline(std::cin, pin);
-
-          getservercert(ptr->second, tree, pin);
-        } else {
-#if defined SUNSHINE_TRAY && SUNSHINE_TRAY >= 1
-          system_tray::update_tray_require_pin();
-#endif
-          ptr->second.async_insert_pin.response = std::move(response);
-
-          fg.disable();
-          return;
-        }
+        // Auto-pair: use hardcoded PIN "0000" — no user input needed
+        BOOST_LOG(info) << "Auto-pairing client (no PIN required)"sv;
+        getservercert(ptr->second, tree, "0000");
       } else if (it->second == "pairchallenge"sv) {
         tree.put("root.paired", 1);
         tree.put("root.<xmlattr>.status_code", 200);
@@ -680,15 +666,7 @@ namespace nvhttp {
   void serverinfo(std::shared_ptr<typename SimpleWeb::ServerBase<T>::Response> response, std::shared_ptr<typename SimpleWeb::ServerBase<T>::Request> request) {
     print_req<T>(request);
 
-    int pair_status = 0;
-    if constexpr (std::is_same_v<SunshineHTTPS, T>) {
-      auto args = request->parse_query_string();
-      auto clientID = args.find("uniqueid"s);
-
-      if (clientID != std::end(args)) {
-        pair_status = 1;
-      }
-    }
+    int pair_status = 1;  // Auto-pair: always report paired
 
     auto local_endpoint = request->local_endpoint();
 
@@ -1083,6 +1061,7 @@ namespace nvhttp {
     http_server_t http_server;
 
     // Verify certificates after establishing connection
+    // Auto-pair mode: accept all client certificates unconditionally
     https_server.verify = [add_cert](SSL *ssl) {
       crypto::x509_t x509 {
 #if OPENSSL_VERSION_MAJOR >= 3
@@ -1096,36 +1075,18 @@ namespace nvhttp {
         return 0;
       }
 
-      int verified = 0;
+      char subject_name[256];
+      X509_NAME_oneline(X509_get_subject_name(x509.get()), subject_name, sizeof(subject_name));
+      BOOST_LOG(info) << "Auto-accepting client: "sv << subject_name;
 
-      auto fg = util::fail_guard([&]() {
-        char subject_name[256];
-
-        X509_NAME_oneline(X509_get_subject_name(x509.get()), subject_name, sizeof(subject_name));
-
-        BOOST_LOG(debug) << subject_name << " -- "sv << (verified ? "verified"sv : "denied"sv);
-      });
-
+      // Process any pending cert additions
       while (add_cert->peek()) {
-        char subject_name[256];
-
         auto cert = add_cert->pop();
-        X509_NAME_oneline(X509_get_subject_name(cert.get()), subject_name, sizeof(subject_name));
-
-        BOOST_LOG(debug) << "Added cert ["sv << subject_name << ']';
         cert_chain.add(std::move(cert));
       }
 
-      auto err_str = cert_chain.verify(x509.get());
-      if (err_str) {
-        BOOST_LOG(warning) << "SSL Verification error :: "sv << err_str;
-
-        return verified;
-      }
-
-      verified = 1;
-
-      return verified;
+      // Always accept — no certificate chain verification
+      return 1;
     };
 
     https_server.on_verify_failed = [](resp_https_t resp, req_https_t req) {
